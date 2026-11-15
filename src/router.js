@@ -25,8 +25,19 @@ export class RouteError extends Error {
  * Starts the first candidate; if it fails → next immediately; if it is slow (hedgeMs) → starts the next one in parallel.
  * Resolves with { candidate, first, rest(), ttfbMs } once a candidate yields its first non-empty delta.
  */
-export async function raceFirstToken({ candidates, open, isCooling = () => false, hedgeMs = 6000, maxParallel = 2, maxAttempts = 10, deadlineMs = 60000, signal, onResult = () => {} }) {
+/** Interleaves candidates across providers (keeps provider order and each provider's own order), so one provider full of dead keys can't starve the others. */
+export function interleaveByProvider(list) {
+  const groups = new Map();
+  for (const c of list) { const id = c.provider?.id ?? ''; if (!groups.has(id)) groups.set(id, []); groups.get(id).push(c); }
+  const queues = [...groups.values()];
+  const out = [];
+  for (let i = 0; out.length < list.length; i++) for (const q of queues) if (i < q.length) out.push(q[i]);
+  return out;
+}
+
+export async function raceFirstToken({ candidates: rawCandidates, open, isCooling = () => false, hedgeMs = 6000, maxParallel = 2, maxAttempts = 10, deadlineMs = 60000, signal, onResult = () => {} }) {
   const started = Date.now();
+  const candidates = interleaveByProvider(rawCandidates);
   const errors = [];
   const live = new Set();
   let next = 0, attempts = 0;
@@ -86,6 +97,7 @@ export async function raceFirstToken({ candidates, open, isCooling = () => false
       if (err?.name === 'AbortError' && signal?.aborted) throw new RouteError(errors, { aborted: true });
       const failure = err || Object.assign(new Error('empty answer'), { kind: 'empty', cooldownMs: 20000 });
       errors.push({ candidate: entry.c, err: failure });
+      if (failure.kind === 'auth' || failure.kind === 'model') attempts--; // dead key / retired model: fails instantly, must not use up the attempt budget
       onResult(entry.c, failure, 0);
       if (live.size === 0) launch(); // fast failover: no waiting
     }
