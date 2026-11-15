@@ -1,0 +1,73 @@
+/**
+ * Keeps technical details away from normal users.
+ *
+ * Anything that comes from a server, a provider or a thrown Error may contain provider names, status codes, key/quota/CORS
+ * wording, JSON or stack traces. None of that should ever be shown in the chat. These helpers turn such text into a short,
+ * plain sentence. The original text is only written to the browser console (for developers).
+ */
+
+export const FRIENDLY = {
+  chat: 'The assistant is having a little trouble right now. Please try again in a moment.',
+  image: 'We couldn’t create the image right now. Please try again in a moment.',
+  imageUnavailable: 'Image creation isn’t available right now. You can still ask me questions or share your code.',
+  network: 'We couldn’t connect right now. Please check your internet connection and try again.',
+  busy: 'The assistant is busy at the moment. Please wait a little and try again.',
+} as const
+
+/** AI / hosting providers and model families. Users never need to see these. */
+const PROVIDERS = /\b(openai|anthropic|claude|gemini|google ?ai|vertex|palm|groq|openrouter|mistral|cohere|deepseek|together ?ai|togetherai|perplexity|hugging ?face|replicate|stability(?:ai)?|stable ?diffusion|flux|cloudflare|workers ?ai|azure|bedrock|aws|xai|grok|ollama|nvidia|fireworks|cerebras|sambanova|llama|qwen|gpt-?\d[\w.-]*|supabase|vercel|railway|render|heroku|netlify)\b/gi
+
+/** Words that only make sense to a developer. */
+const TECH = new RegExp(
+  [
+    'api[_ -]?keys?', 'apikey', 'bearer', 'access[_ -]?token', 'secret', 'credentials?', 'quota', 'rate[_ -]?limit',
+    'status(?: code)?\\s*[:=]?\\s*\\d{3}', 'http\\s?\\d{3}', '\\b[45]\\d{2}\\b', 'stack ?trace', 'traceback', 'exception',
+    '\\bundefined\\b', '\\bnull\\b', 'econn\\w*', 'enotfound', 'etimedout', 'cors', 'fetch failed', 'failed to fetch', 'networkerror',
+    'socket', 'upstream', 'providers?', 'fall-?back', 'endpoints?', 'binding', '\\bworker\\b', 'VITE_', 'env(?:ironment)?\\s+var',
+    'unauthori[sz]ed', 'forbidden', 'internal server error', '\\bjson\\b', 'syntax ?error', 'unexpected token', 'model[_ -]?(?:id|name|not found)',
+    'all (?:\\w+ )?(?:providers|models|services|attempts) (?:failed|exhausted|unavailable)', 'billing', 'insufficient', 'deprecated',
+    'invalid[_ ]request', '\\{', '\\}', '\\[object', '\\bat \\w+[.\\w]* \\(', '\\.(?:ts|tsx|js|py|mjs):\\d+', 'err_[a-z_]+', 'ERR_', '0x[0-9a-f]{4,}',
+  ].join('|'),
+  'i',
+)
+
+const ERRORISH = /(fail|error|unavailable|exhaust|quota|limit|tried|attempt|unable|invalid|denied|refus|timeout|timed out|not (?:available|configured|supported|found)|missing)/i
+
+const distinctProviders = (s: string) => new Set((s.match(PROVIDERS) ?? []).map((x) => x.toLowerCase())).size
+
+/** True when text reads like an internal error rather than something written for a person. */
+export function looksTechnical(text: string): boolean {
+  const s = (text ?? '').trim()
+  if (!s) return false
+  if (TECH.test(s)) return true
+  return distinctProviders(s) >= 1 && ERRORISH.test(s)
+}
+
+/** Error text from a server / thrown error → a safe sentence. Plain human messages pass through unchanged. */
+export function friendlyError(raw: unknown, fallback: string = FRIENDLY.chat): string {
+  const s = typeof raw === 'string' ? raw.trim() : raw instanceof Error ? raw.message.trim() : ''
+  if (!s) return fallback
+  if (s.length > 220 || looksTechnical(s)) { console.warn('[Forked] Hidden technical message from the user:', s); return fallback }
+  return s
+}
+
+/**
+ * Even a "successful" AI answer can be an error dump (for example a list of every provider that failed).
+ * Only short answers that name several providers next to failure wording are replaced, so real answers about APIs stay intact.
+ */
+export function isLeakedProviderDump(text: string): boolean {
+  const s = (text ?? '').trim()
+  if (!s || s.length > 900) return false
+  const n = distinctProviders(s)
+  if (n >= 3 && ERRORISH.test(s)) return true
+  if (n >= 2 && ERRORISH.test(s) && /\b(providers?|fall-?back|attempt(?:ed|s)?|tried)\b/i.test(s)) return true
+  return /\b(all|every|no) (?:\w+ )?(?:providers?|models?|api[s ]?)\b[^.]{0,40}\b(failed|unavailable|exhausted|down)\b/i.test(s)
+}
+
+/** What the chat bubble should show for a stored AI text. */
+export function safeAnswer(text: string | undefined, isError: boolean): { text: string; hidden: boolean } {
+  const s = text ?? ''
+  if (isError) { const out = friendlyError(s, FRIENDLY.chat); return { text: out, hidden: out !== s } }
+  if (isLeakedProviderDump(s)) return { text: FRIENDLY.chat, hidden: true }
+  return { text: s, hidden: false }
+}

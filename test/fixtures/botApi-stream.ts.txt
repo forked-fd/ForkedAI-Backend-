@@ -1,0 +1,89 @@
+// VERBATIM copy of the stream parser in Forked-Learn src/services/botApi.ts (refresh if that file changes)
+function idleGuard(signal: AbortSignal | undefined) {
+  const ctrl = new AbortController()
+  let timedOut = false
+  let timer = 0
+  const arm = (ms: number) => { window.clearTimeout(timer); timer = window.setTimeout(() => { timedOut = true; ctrl.abort() }, ms) }
+  const onAbort = () => ctrl.abort()
+  if (signal?.aborted) ctrl.abort(); else signal?.addEventListener('abort', onAbort, { once: true })
+  arm(STREAM_FIRST_BYTE_MS)
+  return { signal: ctrl.signal, touch: () => arm(STREAM_IDLE_MS), timedOut: () => timedOut, done: () => { window.clearTimeout(timer); signal?.removeEventListener('abort', onAbort) } }
+}
+
+type Json = Record<string, unknown>
+const isObj = (v: unknown): v is Json => !!v && typeof v === 'object'
+
+function pickDelta(o: unknown): string | null {
+  if (typeof o === 'string') return o
+  if (!isObj(o)) return null
+  const choices = o.choices
+  if (Array.isArray(choices) && isObj(choices[0])) {
+    const c = choices[0]
+    const d = (isObj(c.delta) ? c.delta.content : undefined) ?? c.text ?? (isObj(c.message) ? c.message.content : undefined)
+    if (typeof d === 'string') return d
+  }
+  if (o.type === 'content_block_delta' && isObj(o.delta) && typeof o.delta.text === 'string') return o.delta.text
+  for (const k of ['delta', 'token', 'text', 'content', 'response', 'chunk']) { const v = o[k]; if (typeof v === 'string') return v }
+  if (isObj(o.data)) return pickDelta(o.data)
+  return null
+}
+
+function pickError(o: unknown): string | null {
+  if (!isObj(o)) return null
+  if (o.success === false) return friendlyError(String(o.message ?? o.error ?? ''), FRIENDLY.chat)
+  const e = o.error
+  if (typeof e === 'string' && e) return friendlyError(e, FRIENDLY.chat)
+  if (isObj(e) && typeof e.message === 'string') return friendlyError(e.message, FRIENDLY.chat)
+  return null
+}
+
+async function consumeStream(res: Response, kind: 'sse' | 'ndjson' | 'text', onDelta: (c: string) => void, touch: () => void): Promise<string> {
+  if (!res.body) throw new BotError('server', 'The assistant didn’t reply this time. Please try again.')
+  const reader = res.body.getReader()
+  const dec = new TextDecoder()
+  let buf = ''
+  let all = ''
+  const st = { final: '' }
+  const emit = (c: string) => { if (c) { all += c; onDelta(c) } }
+  const handlePayload = (payload: string, event: string) => {
+    if (payload === '[DONE]') return 'done'
+    let parsed: unknown = payload
+    try { parsed = JSON.parse(payload) } catch { /* raw text delta */ }
+    const err = event === 'error' ? (pickError(parsed) ?? friendlyError(isObj(parsed) && typeof parsed.message === 'string' ? parsed.message : typeof parsed === 'string' ? parsed : '', FRIENDLY.chat)) : pickError(parsed)
+    if (err) throw new BotError('server', err)
+    const text = pickDelta(parsed)
+    if (/^(done|end|final|complete)$/i.test(event) || (isObj(parsed) && parsed.done === true)) { if (text) st.final = text; return 'done' }
+    if (text) emit(text)
+    return 'ok'
+  }
+  const flush = (last: boolean) => {
+    if (kind === 'text') { emit(buf); buf = ''; return }
+    if (kind === 'ndjson') {
+      const lines = buf.split('\n'); buf = last ? '' : (lines.pop() ?? '')
+      for (const l of lines) { const t = l.trim(); if (t) handlePayload(t, '') }
+      return
+    }
+    const frames = buf.split(/\r?\n\r?\n/); buf = last ? '' : (frames.pop() ?? '')
+    for (const fr of frames) {
+      let event = ''; const data: string[] = []
+      for (const line of fr.split(/\r?\n/)) {
+        if (line.startsWith(':')) continue
+        if (line.startsWith('event:')) event = line.slice(6).trim()
+        else if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''))
+      }
+      if (data.length || event) handlePayload(data.join('\n'), event)
+    }
+  }
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    touch()
+    buf += dec.decode(value, { stream: true })
+    flush(false)
+  }
+  buf += dec.decode()
+  flush(true)
+  if (!all && st.final) emit(st.final)
+  return all
+}
+
